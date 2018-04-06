@@ -1222,6 +1222,63 @@ unsigned int static DarkGravityWave3(const CBlockIndex* pindexLast, uint64 Targe
     return bnNew.GetCompact();
 }
 
+unsigned int static DarkGravityWave3_1(const CBlockIndex* pIndexLast, uint64 targetBlocksSpacingSeconds, int algo)
+{
+    /* Dark Gravity Wave with a potential fix for timestamp attack. Based on Dash implementation */
+    CBigNum powLimit = bnProofOfWorkLimit[algo];
+    const int64_t pastBlocksCount = 24;
+    
+
+    if (!pIndexLast || pIndexLast->nHeight < pastBlocksCount)
+        return powLimit.GetCompact();
+    
+    const CBlockIndex *pIndex = pIndexLast;
+    CBigNum pastTargetAvg;
+
+    for (unsigned blocksCount = 1; blocksCount <= pastBlocksCount; )
+    {
+        if (GetAlgo(pIndex->nVersion) != algo) {
+            assert(pIndex->pprev);
+        	pIndex = pIndex->pprev;
+            continue;
+        }
+
+        CBigNum target = CBigNum().SetCompact(pIndex->nBits);
+        if (blocksCount == 1)
+            pastTargetAvg = target;
+        else
+            pastTargetAvg = (pastTargetAvg * blocksCount + target) / (blocksCount + 1);
+
+        if (blocksCount++ != pastBlocksCount)
+        {
+            assert(pIndex->pprev);
+            pIndex = pIndex->pprev;
+        }
+    }
+
+    CBigNum newTarget(pastTargetAvg);
+    //note: calculating actual timespan by adding diffs in each loop iteration is most likely
+    //      vulnerable to timestamp manipulation attacks.
+    int64_t actualTimespan = pIndexLast->GetBlockTime() - pIndex->GetBlockTime();
+    //note: We use multiple algos. Can we rely simply on targetTimespan like this? Won't it cause
+    //      big fluctuations of difficulty? In other words should all algos try to get closer to
+    //      ideal target timespan as they were the only algo used?
+    int64_t targetTimespan = pastBlocksCount * targetBlocksSpacingSeconds;
+
+    if (actualTimespan < targetTimespan / 3)
+        actualTimespan = targetTimespan / 3;
+    if (actualTimespan > targetTimespan * 3)
+        actualTimespan = targetTimespan * 3;
+
+    newTarget *= actualTimespan;
+    newTarget /= targetTimespan;
+
+    if (newTarget > powLimit)
+        newTarget = powLimit;
+    
+    return newTarget.GetCompact();
+}
+
 unsigned int GetNextTargetRequired_V1(const CBlockIndex* pindexLast, bool fProofOfStake, int algo)
 {
     if (pindexLast == NULL)
@@ -1268,12 +1325,16 @@ unsigned int GetNextTargetRequired_V1(const CBlockIndex* pindexLast, bool fProof
 
 unsigned int GetNextTargetRequired(const CBlockIndex* pindexLast, bool fProofOfStake, int algo)
 {
-        if (pindexLast->nHeight < MULTI_ALGO_SWITCH_BLOCK)
-        {
-                return GetNextTargetRequired_V1(pindexLast, fProofOfStake, algo);
-        }
+    if (pindexLast->nHeight + 1 >= DIFFICULTY_ALGO_SWITCH_BLOCK)
+    {
+        return DarkGravityWave3_1(pindexLast, nProofOfWorkTargetSpacing, algo);
+    }
+    else if (pindexLast->nHeight + 1 >= MULTI_ALGO_SWITCH_BLOCK)
+    {
         return DarkGravityWave3(pindexLast, nProofOfWorkTargetSpacing, algo);
-
+    }
+    
+    return GetNextTargetRequired_V1(pindexLast, fProofOfStake, algo);
 }
 
 bool CheckProofOfWork(uint256 hash, unsigned int nBits, int algo)
@@ -2304,20 +2365,8 @@ bool CBlock::AcceptBlock()
         return DoS(100, error("AcceptBlock() : incorrect %s", IsProofOfWork() ? "proof-of-work" : "proof-of-stake"));
 
     // Check timestamp against prev
-    if (nHeight <= TIMESTAMP_RULES_SWITCH_BLOCK)
-    {
-        const unsigned oldMaxDrift = 7200; //2 hours
-        if (GetBlockTime() <= pindexPrev->GetMedianTimePast() || GetBlockTime() + oldMaxDrift < pindexPrev->GetBlockTime())
-            return error("AcceptBlock() : block's timestamp is too early");
-    }
-    else
-    {
-        if (GetBlockTime() < pindexPrev->GetBlockTime())
-            return error("AcceptBlock() : block's timestamp is too early");
-
-        if (GetBlockTime() > GetAdjustedTime() + nMaxClockDrift)
-            return error("AcceptBlock() : block too much in the future");
-    }
+    if (GetBlockTime() <= pindexPrev->GetMedianTimePast() || GetBlockTime() + nMaxClockDrift < pindexPrev->GetBlockTime())
+        return error("AcceptBlock() : block's timestamp is too early");
 
     // Check that all transactions are finalized
     BOOST_FOREACH(const CTransaction& tx, vtx)
